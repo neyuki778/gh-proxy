@@ -9,6 +9,7 @@ const ALLOWED_UPSTREAM_HOSTS = new Set([
 const ALLOWED_METHODS = new Set(["GET", "HEAD", "POST"]);
 const ALLOWED_SERVICE = new Set(["git-upload-pack", "git-receive-pack"]);
 const AUX_HOST_ROUTE_PREFIX = "/__host/";
+const DEFAULT_ALLOWED_COUNTRIES = new Set(["CN"]);
 const FORWARDED_HEADER_ALLOWLIST = new Set([
   "accept",
   "accept-encoding",
@@ -132,10 +133,36 @@ function rewriteRedirectLocation(clientUrl, upstreamLocation, currentHost) {
   return `${clientUrl.origin}${proxyPath}`;
 }
 
+function buildAllowedCountries(env) {
+  const raw = typeof env?.ALLOWED_COUNTRIES === "string" ? env.ALLOWED_COUNTRIES : "";
+  if (!raw.trim()) {
+    return DEFAULT_ALLOWED_COUNTRIES;
+  }
+
+  const items = raw
+    .split(",")
+    .map((v) => v.trim().toUpperCase())
+    .filter(Boolean);
+
+  return items.length > 0 ? new Set(items) : DEFAULT_ALLOWED_COUNTRIES;
+}
+
+function isAllowedCountry(request, env) {
+  const country = (request.cf && request.cf.country ? request.cf.country : "").toUpperCase();
+  const allowed = buildAllowedCountries(env);
+  return country && allowed.has(country);
+}
+
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const target = parseUpstreamTarget(url.pathname);
+
+    if (!isAllowedCountry(request, env)) {
+      return new Response("Geo blocked. This endpoint is only available from allowed regions.", {
+        status: 403,
+      });
+    }
 
     if (!ALLOWED_METHODS.has(request.method)) {
       return new Response("Only Git HTTP methods are allowed.", { status: 405 });
