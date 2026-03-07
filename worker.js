@@ -45,6 +45,26 @@ function isAllowedCountry(request, env) {
   return buildAllowedCountries(env).has(country);
 }
 
+function isLikelyBrowserRequest(request) {
+  const ua = request.headers.get("user-agent") || "";
+  const accept = request.headers.get("accept") || "";
+  const hasSecFetchHeaders =
+    request.headers.has("sec-fetch-site") ||
+    request.headers.has("sec-fetch-mode") ||
+    request.headers.has("sec-fetch-dest");
+
+  if (hasSecFetchHeaders) {
+    return true;
+  }
+
+  const looksBrowserUa = /\b(Mozilla|Chrome|Safari|Edg|Firefox)\b/i.test(ua);
+  if (looksBrowserUa && accept.includes("text/html")) {
+    return true;
+  }
+
+  return false;
+}
+
 function shouldRouteToRaw(pathname) {
   if (pathname.includes("/raw/")) {
     return true;
@@ -110,6 +130,10 @@ export default {
       return new Response("Geo blocked. This endpoint is only available from allowed regions.", {
         status: 403,
       });
+    }
+
+    if (isLikelyBrowserRequest(request)) {
+      return new Response("Browser access is disabled.", { status: 403 });
     }
 
     if (request.method === "OPTIONS") {
