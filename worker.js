@@ -16,6 +16,8 @@ const FORWARDED_HEADER_ALLOWLIST = new Set([
   "accept-language",
   "authorization",
   "cache-control",
+  "content-encoding",
+  "content-length",
   "content-type",
   "git-protocol",
   "if-modified-since",
@@ -113,26 +115,6 @@ function buildUpstreamHeaders(request) {
   return out;
 }
 
-function rewriteRedirectLocation(clientUrl, upstreamLocation, currentHost) {
-  let upstream;
-  try {
-    upstream = new URL(upstreamLocation, `https://${currentHost}`);
-  } catch {
-    return null;
-  }
-
-  if (!ALLOWED_UPSTREAM_HOSTS.has(upstream.host)) {
-    return null;
-  }
-
-  const proxyPath =
-    upstream.host === DEFAULT_UPSTREAM_HOST
-      ? `${upstream.pathname}${upstream.search}`
-      : `${AUX_HOST_ROUTE_PREFIX}${upstream.host}${upstream.pathname}${upstream.search}`;
-
-  return `${clientUrl.origin}${proxyPath}`;
-}
-
 function buildAllowedCountries(env) {
   const raw = typeof env?.ALLOWED_COUNTRIES === "string" ? env.ALLOWED_COUNTRIES : "";
   if (!raw.trim()) {
@@ -185,7 +167,7 @@ export default {
       method: request.method,
       headers: buildUpstreamHeaders(request),
       body: request.method === "GET" || request.method === "HEAD" ? null : request.body,
-      redirect: "manual",
+      redirect: "follow",
     });
 
     try {
@@ -193,15 +175,6 @@ export default {
       const outHeaders = new Headers(response.headers);
       outHeaders.set("X-Git-Proxy", "github-only");
       outHeaders.delete("set-cookie");
-
-      const location = outHeaders.get("location");
-      if (location) {
-        const rewritten = rewriteRedirectLocation(url, location, target.host);
-        if (!rewritten) {
-          return new Response("Blocked redirect target.", { status: 403 });
-        }
-        outHeaders.set("location", rewritten);
-      }
 
       return new Response(response.body, {
         status: response.status,
