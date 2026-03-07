@@ -1,14 +1,5 @@
-const DEFAULT_UPSTREAM_HOST = "github.com";
-const ALLOWED_UPSTREAM_HOSTS = new Set([
-  "github.com",
-  "api.github.com",
-  "raw.githubusercontent.com",
-  "codeload.github.com",
-  "objects.githubusercontent.com",
-]);
-const ALLOWED_METHODS = new Set(["GET", "HEAD", "POST"]);
-const ALLOWED_SERVICE = new Set(["git-upload-pack", "git-receive-pack"]);
-const AUX_HOST_ROUTE_PREFIX = "/__host/";
+const GITHUB_HOST = "github.com";
+const RAW_HOST = "raw.githubusercontent.com";
 const DEFAULT_ALLOWED_COUNTRIES = new Set(["CN"]);
 const FORWARDED_HEADER_ALLOWLIST = new Set([
   "accept",
@@ -20,86 +11,66 @@ const FORWARDED_HEADER_ALLOWLIST = new Set([
   "content-length",
   "content-type",
   "git-protocol",
+  "if-match",
   "if-modified-since",
   "if-none-match",
+  "if-range",
+  "if-unmodified-since",
   "pragma",
   "range",
   "user-agent",
 ]);
 
-function isLikelyBrowser(request) {
-  const ua = request.headers.get("user-agent") || "";
-  const accept = request.headers.get("accept") || "";
-  const hasSecFetch =
-    request.headers.has("sec-fetch-site") ||
-    request.headers.has("sec-fetch-mode") ||
-    request.headers.has("sec-fetch-dest");
+function buildAllowedCountries(env) {
+  const raw = typeof env?.ALLOWED_COUNTRIES === "string" ? env.ALLOWED_COUNTRIES : "";
+  if (!raw.trim()) {
+    return DEFAULT_ALLOWED_COUNTRIES;
+  }
 
-  return (
-    hasSecFetch ||
-    /\b(Mozilla|Chrome|Safari|Edg)\b/i.test(ua) ||
-    accept.includes("text/html")
-  );
+  const values = raw
+    .split(",")
+    .map((v) => v.trim().toUpperCase())
+    .filter(Boolean);
+
+  return values.length > 0 ? new Set(values) : DEFAULT_ALLOWED_COUNTRIES;
 }
 
-function isAllowedGitPath(pathname, searchParams) {
-  // Git Smart HTTP discovery: /<owner>/<repo>.git/info/refs?service=git-upload-pack
-  if (pathname.endsWith("/info/refs")) {
-    return ALLOWED_SERVICE.has(searchParams.get("service") || "");
-  }
-
-  // Git Smart HTTP data endpoints
-  if (pathname.endsWith("/git-upload-pack") || pathname.endsWith("/git-receive-pack")) {
-    return true;
-  }
-
-  // Optional dumb-http object requests (some clients still probe these paths)
-  if (
-    /\/objects\/[0-9a-f]{2}\/[0-9a-f]{38}$/i.test(pathname) ||
-    /\/objects\/pack\/pack-[0-9a-f]{40}\.(pack|idx)$/i.test(pathname) ||
-    pathname.endsWith("/objects/info/packs") ||
-    pathname.endsWith("/HEAD")
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-function parseUpstreamTarget(pathname) {
-  if (!pathname.startsWith(AUX_HOST_ROUTE_PREFIX)) {
-    return { host: DEFAULT_UPSTREAM_HOST, path: pathname };
-  }
-
-  const rest = pathname.slice(AUX_HOST_ROUTE_PREFIX.length);
-  const firstSlash = rest.indexOf("/");
-  if (firstSlash <= 0) {
-    return { error: "Invalid upstream host route." };
-  }
-
-  const host = rest.slice(0, firstSlash).toLowerCase();
-  const path = rest.slice(firstSlash);
-  if (!ALLOWED_UPSTREAM_HOSTS.has(host)) {
-    return { error: "Upstream host is not allowed." };
-  }
-
-  return { host, path };
-}
-
-function isAllowedTarget(host, pathname, searchParams, method) {
-  if (!ALLOWED_UPSTREAM_HOSTS.has(host)) {
+function isAllowedCountry(request, env) {
+  const fromCfObject = request.cf && request.cf.country ? request.cf.country : "";
+  const fromHeader = request.headers.get("cf-ipcountry") || "";
+  const country = (fromCfObject || fromHeader).toUpperCase();
+  if (!country) {
     return false;
   }
-
-  if (host === DEFAULT_UPSTREAM_HOST) {
-    return isAllowedGitPath(pathname, searchParams);
-  }
-
-  // Aux hosts are only for redirected binary/content fetches.
-  return method === "GET" || method === "HEAD";
+  return buildAllowedCountries(env).has(country);
 }
 
-function buildUpstreamHeaders(request) {
+function shouldRouteToRaw(pathname) {
+  if (pathname.includes("/raw/")) {
+    return true;
+  }
+
+  // /owner/repo/refs/heads/<branch>/file
+  return /^\/[^/]+\/[^/]+\/refs\/heads\/.+/.test(pathname);
+}
+
+function rewriteRawPath(pathname) {
+  if (!pathname.includes("/raw/")) {
+    return pathname;
+  }
+
+  // /owner/repo/raw/<...> -> /owner/repo/<...>
+  return pathname.replace("/raw/", "/");
+}
+
+function resolveUpstream(pathname) {
+  if (shouldRouteToRaw(pathname)) {
+    return { host: RAW_HOST, path: rewriteRawPath(pathname) };
+  }
+  return { host: GITHUB_HOST, path: pathname };
+}
+
+function buildUpstreamHeaders(request, upstreamHost) {
   const out = new Headers();
   for (const key of FORWARDED_HEADER_ALLOWLIST) {
     const value = request.headers.get(key);
@@ -108,64 +79,50 @@ function buildUpstreamHeaders(request) {
     }
   }
 
-  if (!out.has("user-agent")) {
-    out.set("user-agent", "git-proxy-worker/1.0");
-  }
+  out.set("Host", upstreamHost);
+  out.set("Origin", `https://${upstreamHost}`);
+  out.delete("referer");
 
+  if (!out.has("user-agent")) {
+    out.set("user-agent", "github-accelerator-worker/1.0");
+  }
   return out;
 }
 
-function buildAllowedCountries(env) {
-  const raw = typeof env?.ALLOWED_COUNTRIES === "string" ? env.ALLOWED_COUNTRIES : "";
-  if (!raw.trim()) {
-    return DEFAULT_ALLOWED_COUNTRIES;
-  }
+function appendCorsHeaders(headers, request) {
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS");
 
-  const items = raw
-    .split(",")
-    .map((v) => v.trim().toUpperCase())
-    .filter(Boolean);
-
-  return items.length > 0 ? new Set(items) : DEFAULT_ALLOWED_COUNTRIES;
+  const reqHeaders = request.headers.get("Access-Control-Request-Headers");
+  headers.set("Access-Control-Allow-Headers", reqHeaders || "*");
+  headers.set("Access-Control-Max-Age", "86400");
 }
 
-function isAllowedCountry(request, env) {
-  const country = (request.cf && request.cf.country ? request.cf.country : "").toUpperCase();
-  const allowed = buildAllowedCountries(env);
-  return country && allowed.has(country);
+function handleOptions(request) {
+  const headers = new Headers();
+  appendCorsHeaders(headers, request);
+  return new Response(null, { status: 204, headers });
 }
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const target = parseUpstreamTarget(url.pathname);
-
     if (!isAllowedCountry(request, env)) {
       return new Response("Geo blocked. This endpoint is only available from allowed regions.", {
         status: 403,
       });
     }
 
-    if (!ALLOWED_METHODS.has(request.method)) {
-      return new Response("Only Git HTTP methods are allowed.", { status: 405 });
+    if (request.method === "OPTIONS") {
+      return handleOptions(request);
     }
 
-    if (target.error) {
-      return new Response(target.error, { status: 400 });
-    }
+    const url = new URL(request.url);
+    const upstream = resolveUpstream(url.pathname);
+    const upstreamUrl = `https://${upstream.host}${upstream.path}${url.search}`;
 
-    if (!isAllowedTarget(target.host, target.path, url.searchParams, request.method)) {
-      return new Response("This endpoint only proxies Git protocol traffic.", { status: 403 });
-    }
-
-    if (isLikelyBrowser(request)) {
-      return new Response("Browser access is disabled.", { status: 403 });
-    }
-
-    const upstreamUrl = `https://${target.host}${target.path}${url.search}`;
     const proxyRequest = new Request(upstreamUrl, {
       method: request.method,
-      headers: buildUpstreamHeaders(request),
+      headers: buildUpstreamHeaders(request, upstream.host),
       body: request.method === "GET" || request.method === "HEAD" ? null : request.body,
       redirect: "follow",
     });
@@ -173,8 +130,9 @@ export default {
     try {
       const response = await fetch(proxyRequest);
       const outHeaders = new Headers(response.headers);
-      outHeaders.set("X-Git-Proxy", "github-only");
       outHeaders.delete("set-cookie");
+      outHeaders.set("X-GitHub-Proxy", "gghub");
+      appendCorsHeaders(outHeaders, request);
 
       return new Response(response.body, {
         status: response.status,
@@ -182,8 +140,11 @@ export default {
         headers: outHeaders,
       });
     } catch (err) {
+      const headers = new Headers();
+      appendCorsHeaders(headers, request);
       return new Response(`Upstream fetch failed: ${err?.message || "unknown error"}`, {
         status: 502,
+        headers,
       });
     }
   },
